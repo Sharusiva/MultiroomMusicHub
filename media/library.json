@@ -1,0 +1,72 @@
+[
+  {
+    "file": "midnight-lofi.mp3",
+    "title": "Midnight Lo-Fi",
+    "artist": "Sol Static",
+    "genre": "Lo-fi",
+    "color": "#8b5cf6"
+  },
+  {
+    "file": "neon-drive.mp3",
+    "title": "Neon Drive",
+    "artist": "Synth Harbor",
+    "genre": "Synthwave",
+    "color": "#ec4899"
+  },
+  {
+    "file": "glass-garden.mp3",
+    "title": "Glass Garden",
+    "artist": "Aurora Fields",
+    "genre": "Ambient",
+    "color": "#14b8a6"
+  },
+  {
+    "file": "sunday-kitchen.mp3",
+    "title": "Sunday Kitchen",
+    "artist": "The Toast Ensemble",
+    "genre": "Pop",
+    "color": "#f59e0b"
+  },
+  {
+    "file": "pixel-quest.mp3",
+    "title": "Pixel Quest",
+    "artist": "8-Bit Navigator",
+    "genre": "Chiptune",
+    "color": "#22c55e"
+  },
+  {
+    "file": "deep-room-4am.mp3",
+    "title": "Deep Room 4AM",
+    "artist": "Basement Theory",
+    "genre": "House",
+    "color": "#3b82f6"
+  },
+  {
+    "file": "rainy-window.mp3",
+    "title": "Rainy Window",
+    "artist": "Blue Note Robots",
+    "genre": "Jazz-hop",
+    "color": "#06b6d4"
+  },
+  {
+    "file": "paper-lanterns.mp3",
+    "title": "Paper Lanterns",
+    "artist": "Mira Keys",
+    "genre": "Piano",
+    "color": "#f97316"
+  },
+  {
+    "file": "mirrorball.mp3",
+    "title": "Mirrorball",
+    "artist": "Velvet Elevator",
+    "genre": "Disco",
+    "color": "#ef4444"
+  },
+  {
+    "file": "night-circuit.mp3",
+    "title": "Night Circuit",
+    "artist": "Halfstep Kids",
+    "genre": "Drum & bass",
+    "color": "#a3e635"
+  }
+]

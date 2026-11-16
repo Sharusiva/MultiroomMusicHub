@@ -1,5 +1,11 @@
 node_modules/
+dist/
 __pycache__/
 *.pyc
 .env
 .DS_Store
+*.rdb
+*.db
+media/uploads/
+loadtest/loadtest-results.json
+Claude outputs/

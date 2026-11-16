@@ -2,6 +2,7 @@ flask==3.0.3
 flask-socketio==5.3.6
 flask-sqlalchemy==3.1.1
 psycopg2-binary==2.9.10
+psycogreen==1.0.2
 redis==5.0.4
-python-dotenv==1.0.1
-eventlet==0.36.1
+eventlet==0.40.4
+mutagen==1.47.0
