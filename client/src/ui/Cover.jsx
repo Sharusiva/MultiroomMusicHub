@@ -15,7 +15,7 @@ export default function Cover({ track, className = "", alt = "" }) {
   const initials = (track?.title || track?.now_playing || "").split(/\s+/).map((w) => w[0]).join("").slice(0, 2);
   return (
     <div className={`cover ${className}`} style={{ background: track?.color || "var(--stone-deep)" }} aria-hidden={!alt}>
-      <span className="cover-fallback" style={{ fontSize: "38%" }}>{initials}</span>
+      <span className="cover-fallback">{initials}</span>
     </div>
   );
 }

@@ -12,8 +12,15 @@
 //    target. Small drift is corrected by nudging playbackRate (inaudible),
 //    large drift with a hard seek.
 
-const HARD_SEEK = 0.2; // seconds
-const SOFT_ZONE = 0.02; // seconds; below this we consider the device in sync
+// Corrections are deliberately gentle. Safari's audio clock jitters by tens of
+// milliseconds, and its pitch-preserving time-stretch crackles on dense music, so
+// reacting to every wobble (the old 20 ms / ±5% settings) was audible.
+const HARD_SEEK = 0.25; // seconds of smoothed drift before we jump
+const SEEK_COOLDOWN = 2500; // ms; let a seek settle before judging drift again
+const NUDGE_START = 0.045; // seconds; start speed-correcting above this...
+const NUDGE_STOP = 0.015; // ...and stop once back under this (hysteresis)
+const MAX_NUDGE = 0.02; // ±2% playback speed at most
+const SMOOTH = 0.3; // weight of each new drift sample in the moving average
 
 function silentWavUrl() {
   const sr = 8000, n = 800;
@@ -32,6 +39,13 @@ export class SyncPlayer {
     this.clock = clock;
     this.audio = new Audio();
     this.audio.preload = "auto";
+    // Plain resampling for the tiny ±2% nudges instead of the browser's time-stretch,
+    // which is what crackles in Safari. A 2% speed change is a barely-there pitch shift.
+    this.audio.preservesPitch = false;
+    this.audio.webkitPreservesPitch = false;
+    this.audio.mozPreservesPitch = false;
+    this.nudging = false;
+    this.lastSeek = 0;
     this.state = null;
     this.loadedUrl = null;
     this.startTimer = null;
@@ -114,6 +128,9 @@ export class SyncPlayer {
       this.audio.load();
     }
     this.audio.playbackRate = 1;
+    this.nudging = false;
+    this.drift = 0;
+    this.lastSeek = performance.now(); // every apply re-positions the audio
     if (!s.is_playing) {
       this.audio.pause();
       this.seekTo(s.offset);
@@ -133,6 +150,27 @@ export class SyncPlayer {
       this.seekTo(this.target());
       this.play();
     }
+  }
+
+  // What this room node is actually doing, reported to the controller every few
+  // seconds (and right away when it changes) so every device can see speaker health.
+  status() {
+    const s = this.state;
+    const a = this.audio;
+    let state;
+    if (!s || !s.track) state = "idle";
+    else if (!s.is_playing) state = "paused";
+    else if (this.blocked) state = "blocked";
+    else if (this.startTimer) state = "starting";
+    else if (a.paused || a.readyState < 3 || a.seeking) state = "buffering";
+    else state = "playing";
+    return {
+      state,
+      position: Number.isFinite(a.currentTime) ? +a.currentTime.toFixed(2) : null,
+      drift_ms: state === "playing" ? +(this.drift * 1000).toFixed(1) : null,
+      version: s?.version ?? null,
+      track_id: s?.track?.id ?? null,
+    };
   }
 
   reportEnded() {
@@ -157,15 +195,26 @@ export class SyncPlayer {
       return;
     }
     if (a.readyState < 3 || a.seeking) return;
-    const drift = a.currentTime - target;
-    this.drift = drift;
-    if (Math.abs(drift) > HARD_SEEK) {
-      a.playbackRate = 1;
-      a.currentTime = target + 0.05; // seeking itself takes a moment
-    } else if (Math.abs(drift) > SOFT_ZONE) {
-      a.playbackRate = Math.min(1.05, Math.max(0.95, 1 - drift * 0.8));
-    } else if (a.playbackRate !== 1) {
-      a.playbackRate = 1;
+    const now = performance.now();
+    const raw = a.currentTime - target;
+    if (now - this.lastSeek < SEEK_COOLDOWN) {
+      this.drift = raw; // just jumped: show it, but don't act on a still-settling clock
+      return;
     }
+    // smooth out clock jitter so one noisy reading doesn't trigger a correction
+    this.drift = this.drift ? this.drift + SMOOTH * (raw - this.drift) : raw;
+    const d = this.drift;
+    if (Math.abs(d) > HARD_SEEK) {
+      a.playbackRate = 1;
+      this.nudging = false;
+      this.lastSeek = now;
+      this.drift = 0;
+      a.currentTime = target + 0.05; // seeking itself takes a moment
+      return;
+    }
+    if (!this.nudging && Math.abs(d) > NUDGE_START) this.nudging = true;
+    else if (this.nudging && Math.abs(d) < NUDGE_STOP) this.nudging = false;
+    const rate = this.nudging ? Math.min(1 + MAX_NUDGE, Math.max(1 - MAX_NUDGE, 1 - d * 0.5)) : 1;
+    if (Math.abs(a.playbackRate - rate) > 0.002) a.playbackRate = +rate.toFixed(3);
   }
 }

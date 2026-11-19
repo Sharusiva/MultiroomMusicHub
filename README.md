@@ -177,6 +177,9 @@ About 5 minutes, with a laptop and two phones.
    it plays its own music. In the rooms drawer, press **Link** on it: its card
    slides into your zone and phone B switches to your song at the same position.
    Drag the zone volume and both rooms follow.
+   Then, without leaving your room, open **Library**, press the cast button on a
+   song and choose **Play** next to the other room: phone B starts that song.
+   The speaker list under the song shows each device's live status and drift.
 5. **Load balancer:** switch to the `/cluster` tab. Press **Add 50 listeners**
    and watch the connections split evenly across the three servers; turn on
    **Busy mode** for steady traffic. The round-robin strip shows REST requests
@@ -236,8 +239,10 @@ Results with 300 clients and 3 servers:
      ┌────┴─────┐
    Redis       PostgreSQL
    pub/sub     users, rooms, members,
-   sessions    queues, tracks,
-   presence    playback state (row-locked)
+   live state  queues, tracks,
+   sessions    playback state (row-locked)
+   presence
+   device status
    heartbeats
    rate limits
 ```
@@ -250,11 +255,15 @@ Results with 300 clients and 3 servers:
 | Accounts | Passwords stored as salted scrypt hashes; logins shared by all servers through Redis |
 | Private rooms with invite codes | You only see rooms you created or joined. Others join with the code or invite link (`/?join=CODE`) |
 | Different music in different rooms | Each room has its own queue and playback state in PostgreSQL |
+| Edit and delete uploads | Uploads get a readable title and artist from their file tags or filename (`Artist - Title.mp3`, or Pixabay's `artist-song-title-123456.mp3`). The ⋯ menu on a song you uploaded lets you fix the title and artist, or delete it, which removes it from the library and every room's queue (two taps to confirm). Uploads whose file has gone missing are cleaned up at startup |
+| Send music to another room | In Library, the cast button on a song sends it to any of your other rooms (**Queue** or **Play**) without leaving the room you're in |
+| Speaker status | Every device reports what it's really doing every 2 s (playing, paused, buffering, needs a tap) and its drift. Each speaker shows *in sync*, *catching up*, *out of sync* or *not responding* |
+| Live state in Redis | Each room's current playback state is cached in Redis after every command, so joins and room lists don't hit PostgreSQL |
 | Synchronized playback | Clock sync (Cristian's algorithm) + scheduled start + drift correction |
 | Zones | Linked rooms play the same song in sync |
 | Synced volume | Each room has one volume shared by its devices; a zone's master fader scales linked rooms proportionally |
 | Signal path | The pill under the song opens the chain: file, NGINX, server, clock sync, scheduler, output, zone |
-| Music library | 10 original, royalty-free tracks with original covers, plus uploads |
+| Music library | 10 original, royalty-free tracks with original covers, plus uploads. Uploads (MP3, M4A, WAV, FLAC…) are re-encoded with ffmpeg to the same CBR 192 kbps / 44.1 kHz MP3 as the built-in songs, so every browser (Safari included) seeks and syncs them accurately |
 | Cluster dashboard | At `/cluster` only: connections per server, messages/s, round-robin strip, virtual listener generator |
 | Fault tolerance | Stop any Flask server; its devices reconnect to the others and keep playing |
 
@@ -295,6 +304,17 @@ Results with 300 clients and 3 servers:
 - **Shared session store:** a login issued by flask1 is checked by flask2 or
   flask3 against Redis, so any server can handle any request. Logging out deletes
   the session for every server at once.
+- **Room-node status reports:** devices send `status` every 2 s (and at once
+  when it changes). The controller derives a health value, keeps the report in
+  Redis (`status:<sid>`, 8-second expiry) and re-broadcasts the speaker list only
+  when a device's health changes, so steady devices cost no extra messages. A
+  device whose reports stop is shown as *not responding* even though its socket
+  is still open.
+- **Live state cache:** PostgreSQL is still the only place commands are applied
+  (under the row lock). After each commit the new state is written to Redis
+  (`live:<room_id>`) with a compare-and-set on `version`, so a slower node can
+  never overwrite newer state with older. A cache miss reads PostgreSQL and
+  refills Redis. Hits and misses per server appear in `/api/cluster`.
 - **Transparency:** users never see which server they're on unless they look
   (the signal path and speaker list show it for the demo).
 
@@ -372,6 +392,8 @@ Endpoints marked 🔒 need `Authorization: Bearer <token>` from signup or login.
 | GET | /api/auth/me 🔒 | The logged-in user |
 | GET | /api/tracks 🔒 | Music library |
 | POST | /api/tracks 🔒 | Upload a song (multipart `file`) |
+| PATCH | /api/tracks/:id 🔒 | Rename a song you uploaded `{"title", "artist"}`; devices update live |
+| DELETE | /api/tracks/:id 🔒 | Delete a song you uploaded (built-ins can't be deleted); it's removed from every queue |
 | GET | /api/rooms 🔒 | Your rooms only, with codes, devices and now playing |
 | POST | /api/rooms 🔒 | Create a room `{"name"}`; you become its owner |
 | POST | /api/rooms/join 🔒 | Join with `{"code"}` |
@@ -381,6 +403,8 @@ Endpoints marked 🔒 need `Authorization: Bearer <token>` from signup or login.
 | DELETE | /api/rooms/:id 🔒 | Owner: delete the room for everyone |
 | POST | /api/rooms/:id/link 🔒 | Link into another of your rooms' zone `{"to": "<room id>"}` |
 | POST | /api/rooms/:id/unlink 🔒 | Take a room out of its zone (on the leader: split the zone) |
+| POST | /api/rooms/:id/queue 🔒 | Send a song to any of your rooms `{"track_id", "play": false}` (`play: true` starts it there) |
+| GET | /api/rooms/:id/devices 🔒 | Every device in the zone with its latest status report and health |
 | GET | /api/cluster | Server heartbeats and connection counts (no user or room data) |
 
 ### Socket.IO events
@@ -393,10 +417,11 @@ The handshake must carry `auth: {token, device}`; it's refused otherwise.
 | Client → Server | `leave` | `{}` |
 | Client → Server | `command` | `{room_id, action, ...}` with action `play`, `pause`, `seek`, `next`, `prev`, `jump`, `track_ended`, `queue_add`, `queue_remove`, `queue_clear` |
 | Client → Server | `time_sync` | `{}` → `{server_ms}` |
+| Client → Server | `status` | `{room_id, state, position, drift_ms, version, track_id}` every 2 s |
 | Client → Server | `set_volumes` | `{volumes: {room_id: 0-100}}` (your rooms only) |
 | Server → Client | `state` | Playback anchor, track, version |
 | Server → Client | `queue` | Room queue |
-| Server → Client | `presence` | Devices in the zone and their servers |
+| Server → Client | `presence` | Devices in the zone, their servers, and each one's status and health |
 | Server → Client | `volumes` | Room volumes that changed (sent only to members) |
 | Server → Client | `regroup` | Rooms whose zone changed (re-join) |
 | Server → Client | `room_closed` | The room was deleted, or you left it |

@@ -273,7 +273,8 @@ img { display: block; }
   box-shadow: 0 0 0 1px rgba(31, 30, 27, .08);
 }
 .cover img { width: 100%; height: 100%; object-fit: cover; }
-.cover-fallback { position: absolute; inset: 0; display: grid; place-items: center; font-weight: 600; color: var(--paper); letter-spacing: -.02em; }
+.cover { container-type: inline-size; }
+.cover-fallback { position: absolute; inset: 0; display: grid; place-items: center; font-weight: 600; color: var(--paper); letter-spacing: -.02em; font-size: 34cqw; line-height: 1; }
 .stage .cover { width: 100%; box-shadow: 0 0 0 1px rgba(31, 30, 27, .08), 0 18px 40px -24px rgba(31, 30, 27, .45); }
 .np { display: grid; gap: 14px; padding-bottom: 6px; min-width: 0; }
 .np-where { display: flex; align-items: center; gap: 8px; font-size: 14px; color: var(--ash); }
@@ -304,6 +305,25 @@ img { display: block; }
 .speaker .where { color: var(--ash); font-size: 13px; }
 .speaker .num { font-size: 12px; color: var(--ash); }
 .speaker.me { border-color: var(--ink); }
+.speaker { align-items: center; }
+.speaker .led { flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--ash); }
+.speaker .led.ok { background: var(--orange); }
+.speaker .led.warn { background: transparent; box-shadow: inset 0 0 0 1.5px var(--ink); }
+.speaker .led.bad { background: var(--ink); }
+.speaker .health { font-size: 13px; color: var(--ash); }
+.speaker.alert { border-style: dashed; border-color: var(--ink); }
+.speaker.alert .health { color: var(--ink); font-weight: 500; }
+.speaker-summary { color: var(--ink); }
+
+/* "Send to another room" popover on library songs */
+.send-menu { width: min(320px, calc(100vw - 32px)); padding: 12px; }
+.send-menu h3 { margin: 2px 4px 2px; }
+.send-menu > p { margin: 0 4px 10px; }
+.send-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 6px; padding: 6px 4px; border-top: 1px solid var(--hair); }
+.send-row b { display: block; font-size: 14px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.send-row small { display: block; font-size: 12px; color: var(--ash); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.send-row .btn { height: 30px; padding: 0 10px; font-size: 13px; }
+.send-empty { margin: 4px; font-size: 13px; color: var(--ash); }
 
 /* ----------------------------------------------------------- signal path */
 .signal-pill {
@@ -739,3 +759,15 @@ button.zr-name:hover b { text-decoration: underline; text-underline-offset: 3px;
 @media (prefers-reduced-motion: reduce) {
   * { transition-duration: 0s !important; }
 }
+
+.icon-btn.danger { background: var(--ink); color: var(--paper); }
+
+/* Edit / delete menu for your uploads */
+.song-menu { width: min(320px, calc(100vw - 32px)); }
+.song-menu form { display: grid; gap: 10px; }
+.song-menu label { display: grid; gap: 4px; font-size: 12px; color: var(--ash); }
+.song-menu input { height: 36px; padding: 0 12px; border: 1px solid var(--hair); border-radius: 10px; background: var(--paper); font-size: 14px; color: var(--ink); }
+.song-menu input:focus { outline: 2px solid var(--ink); outline-offset: 0; }
+.song-menu-actions { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+.song-menu-actions .btn { height: 34px; padding: 0 12px; font-size: 13px; gap: 6px; }
+.song-menu-actions .grow { flex: 1; }

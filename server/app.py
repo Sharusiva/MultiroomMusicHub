@@ -46,6 +46,11 @@ PORT = int(os.environ.get("PORT", "5000"))
 # receive the command before the moment they are supposed to start.
 LEAD_MS = int(os.environ.get("START_LEAD_MS", "600"))
 HEARTBEAT_TTL = 3  # seconds; a node that misses heartbeats for this long is considered dead
+STATUS_TTL = 8  # seconds; a device that stops reporting for this long is shown as "not responding"
+LIVE_TTL = 24 * 3600  # seconds; live playback state is re-read from PostgreSQL after this
+# Device health thresholds (absolute drift between a device and the room's shared timeline)
+DRIFT_OK_MS = 100  # people can't hear offsets this small between separate speakers; Safari wobbles ~30-80 ms
+DRIFT_BAD_MS = 300
 
 app = Flask(__name__)
 app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
@@ -67,8 +72,9 @@ socketio = SocketIO(
 )
 r = redis_lib.from_url(REDIS_URL, decode_responses=True)
 
-metrics = {"events": 0, "http": 0}
+metrics = {"events": 0, "http": 0, "live_hits": 0, "live_misses": 0}
 local_clients = {}  # sid -> info dict, for sockets connected to THIS node
+local_status = {}  # sid -> {ms, health, drift_ms} of the last status report a local device sent
 dirty_rooms = set()  # rooms whose presence list must be re-broadcast
 BOOT_MS = int(time.time() * 1000)
 
@@ -87,6 +93,8 @@ def log(*args):
 #   node:<id>                heartbeat JSON, expires after HEARTBEAT_TTL
 #   clients                  hash sid -> {server, room, name, kind}
 #   room:<id>:members        hash sid -> same JSON, for fast per-room lookup
+#   live:<room_id>           live playback state of a zone (see "Live state" below)
+#   status:<sid>             latest status report from a device, expires after STATUS_TTL
 # ---------------------------------------------------------------------------
 
 def save_client(sid, info):
@@ -148,11 +156,20 @@ def presence_payload(leader_id):
             else:
                 devices.append({"name": m["name"], "server": m["server"], "sid": m.get("sid"),
                                 "room_id": rid, "room": names.get(rid, "")})
+    # attach each room node's latest status report (one round trip for the whole zone)
+    reports = r.mget([f"status:{d['sid']}" for d in devices]) if devices else []
+    for d, raw in zip(devices, reports):
+        d["status"] = json.loads(raw) if raw else None
+        d["health"] = d["status"]["health"] if d["status"] else "silent"
+    counts = {}
+    for d in devices:
+        counts[d["health"]] = counts.get(d["health"], 0) + 1
     return {
         "room_id": leader_id,
         "devices": sorted(devices, key=lambda d: (d["room"].lower(), d["name"].lower())),
         "virtual": virtual,
         "per_server": per_server,
+        "health": counts,
     }
 
 
@@ -170,6 +187,21 @@ def gc_dead_nodes():
             removed += 1
     if removed:
         log(f"cleaned up {removed} clients from dead node(s) {sorted(dead)}")
+
+
+def mark_silent_devices():
+    """A connected device whose status reports stopped (tab frozen, phone asleep, audio
+    stack hung) is still 'online' to Socket.IO. Re-broadcast presence once its report
+    expires so everyone sees it as not responding."""
+    t = now_ms()
+    for sid, st in list(local_status.items()):
+        info = local_clients.get(sid)
+        if not info:
+            local_status.pop(sid, None)
+            continue
+        if info.get("room") and st["health"] != "silent" and t - st["ms"] > STATUS_TTL * 1000:
+            st["health"] = "silent"
+            dirty_rooms.add(info["room"])
 
 
 def heartbeat_loop():
@@ -191,6 +223,8 @@ def heartbeat_loop():
             "http_per_sec": round((metrics["http"] - last["http"]) / dt, 1),
             "events_total": metrics["events"],
             "http_total": metrics["http"],
+            "live_state_hits": metrics["live_hits"],
+            "live_state_misses": metrics["live_misses"],
         }
         last, last_t = dict(metrics), t
         try:
@@ -201,6 +235,7 @@ def heartbeat_loop():
             tick += 1
             if tick % 2 == 0:
                 gc_dead_nodes()
+            mark_silent_devices()
         except redis_lib.RedisError as exc:
             log("heartbeat failed:", exc)
 
@@ -260,6 +295,67 @@ def state_payload(state, items):
 def queue_payload(room_id, items=None):
     items = items if items is not None else queue_items(room_id)
     return {"room_id": room_id, "items": [i.to_dict() for i in items]}
+
+
+# ---------------------------------------------------------------------------
+# Live state in Redis
+#
+# PostgreSQL is the durable record and the only place commands are applied (under
+# a row lock). After every committed command the new playback state is also
+# written to Redis as `live:<room_id>`, so reads (joining a room, opening the app,
+# the room list) are served from memory by any node without touching PostgreSQL.
+#
+# Commands on different nodes can finish in any order, so the write is a
+# compare-and-set on `version`: an older state can never overwrite a newer one.
+# If Redis is wiped (or the key expires) the next read falls back to PostgreSQL
+# and repopulates the cache.
+# ---------------------------------------------------------------------------
+
+LIVE_FIELDS = ("room_id", "version", "is_playing", "queue_index", "offset", "anchor_ms",
+               "track", "action", "updated_by")
+_live_cas = r.register_script("""
+local cur = redis.call('GET', KEYS[1])
+if cur then
+  local ok, v = pcall(function() return cjson.decode(cur)['version'] end)
+  if ok and v and tonumber(v) >= tonumber(ARGV[2]) then return 0 end
+end
+redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[3])
+return 1
+""")
+
+
+def live_key(room_id):
+    return f"live:{room_id}"
+
+
+def cache_live_state(payload):
+    data = {k: payload.get(k) for k in LIVE_FIELDS}
+    try:
+        _live_cas(keys=[live_key(data["room_id"])], args=[json.dumps(data), data["version"], LIVE_TTL])
+    except redis_lib.RedisError as exc:  # the cache is an optimisation; PostgreSQL still has it
+        log("live state cache write failed:", exc)
+
+
+def live_state(room_id, items=None):
+    """Current playback state of a zone: from Redis if cached, else PostgreSQL."""
+    raw = None
+    try:
+        raw = r.get(live_key(room_id))
+    except redis_lib.RedisError:
+        pass
+    if raw:
+        metrics["live_hits"] += 1
+        data = json.loads(raw)
+        data.update(server_ms=now_ms(), served_by=SERVER_ID, source="redis")
+        return data
+    metrics["live_misses"] += 1
+    state = db.session.get(PlaybackState, room_id)
+    if state is None:
+        return None
+    payload = state_payload(state, items if items is not None else queue_items(room_id))
+    cache_live_state(payload)
+    payload["source"] = "postgres"
+    return payload
 
 
 QUEUE_ACTIONS = {"queue_add", "queue_remove", "queue_clear"}
@@ -371,6 +467,7 @@ def apply_command(room_id, action, data, by):
     payload = state_payload(state, items)
     queue = queue_payload(room_id, items) if action in QUEUE_ACTIONS else None
     db.session.commit()
+    cache_live_state(payload)
     return payload, queue
 
 
@@ -589,14 +686,29 @@ def upload_track():
     if not tags["duration"]:
         os.remove(path)
         return jsonify({"error": "That file doesn't look like audio we can play."}), 400
-    title = tags["title"]
-    if title.lower().replace(" ", "") == os.path.splitext(os.path.basename(rel))[0].lower():
-        title = os.path.splitext(f.filename)[0]
+    tag_title = tags["title"]
+    if tag_title.lower().replace(" ", "") == os.path.splitext(os.path.basename(rel))[0].lower():
+        tag_title = None  # read_tags fell back to our random stored name, not a real tag
+    title, artist = library.guess_title_artist(f.filename, {"title": tag_title, "artist": tags["artist"]})
     stem = os.path.splitext(os.path.basename(rel))[0]
+    cover = library.extract_embedded_cover(path, MEDIA_DIR, stem)  # before re-encoding drops it
+    # Re-encode to the library's standard format so every browser seeks and syncs it
+    # accurately (see library.normalize_audio). If ffmpeg is missing, keep the original.
+    if library.ffmpeg_available() and not library.is_normalized(path, tags):
+        norm_rel = f"uploads/{stem}.mp3"
+        norm_path = os.path.join(MEDIA_DIR, norm_rel)
+        if library.normalize_audio(path, norm_path):
+            if os.path.abspath(path) != os.path.abspath(norm_path):
+                os.remove(path)
+            rel, path = norm_rel, norm_path
+            fresh = library.read_tags(path)
+            for k in ("codec", "bitrate", "sample_rate", "channels"):
+                tags[k] = fresh[k]
+            tags["duration"] = fresh["duration"] or tags["duration"]
     track = Track(
         filename=rel,
         title=(request.form.get("title") or title)[:200],
-        artist=(request.form.get("artist") or tags["artist"])[:200],
+        artist=(request.form.get("artist") or artist)[:200],
         genre="Upload",
         color=random.choice(library.PALETTE),
         duration=tags["duration"],
@@ -604,13 +716,123 @@ def upload_track():
         bitrate=tags["bitrate"],
         sample_rate=tags["sample_rate"],
         channels=tags["channels"],
-        cover=library.extract_embedded_cover(path, MEDIA_DIR, stem),
+        cover=cover,
         uploaded=True,
+        uploaded_by=g.user.id,
     )
     db.session.add(track)
     db.session.commit()
     socketio.emit("library_changed", {"track": track.to_dict(), "by": SERVER_ID})
     return jsonify(track.to_dict()), 201
+
+
+def remove_track_everywhere(track_id, by):
+    """Takes a song out of every room's queue through the normal locked state machine,
+    so a room playing it moves on cleanly and every device hears the change."""
+    room_ids = sorted({qi.room_id for qi in QueueItem.query.filter_by(track_id=track_id).all()})
+    for room_id in room_ids:
+        for item in QueueItem.query.filter_by(room_id=room_id, track_id=track_id).all():
+            result = apply_command(room_id, "queue_remove", {"item_id": item.id}, by)
+            if result:
+                payload, queue = result
+                socketio.emit("state", payload, to=f"play:{room_id}")
+                socketio.emit("queue", queue, to=f"play:{room_id}")
+    return room_ids
+
+
+def delete_track_files(track):
+    """Deletes an upload's audio file and its extracted cover (never anything outside uploads/)."""
+    for rel in (track.filename, track.cover):
+        if rel and rel.startswith("uploads/") and ".." not in rel:
+            try:
+                os.remove(os.path.join(MEDIA_DIR, rel))
+            except OSError:
+                pass
+
+
+@app.delete("/api/tracks/<int:track_id>")
+@login_required
+def delete_track(track_id):
+    """Delete an uploaded song: whoever uploaded it can (older uploads with no recorded
+    uploader can be removed by anyone). The 10 built-in songs can't be deleted."""
+    track = db.session.get(Track, track_id)
+    if track is None:
+        return jsonify({"error": "That song no longer exists."}), 404
+    if not track.uploaded:
+        return jsonify({"error": "Built-in songs can't be deleted."}), 403
+    if track.uploaded_by and track.uploaded_by != g.user.id:
+        return jsonify({"error": "Only the person who uploaded this song can delete it."}), 403
+    rooms = remove_track_everywhere(track.id, f"{g.user.display_name} (deleted a song)")
+    delete_track_files(track)
+    db.session.delete(db.session.get(Track, track_id))
+    db.session.commit()
+    socketio.emit("library_changed", {"deleted": track_id, "by": SERVER_ID})
+    if rooms:
+        notify_members(rooms, "rooms_changed", {"by": SERVER_ID})
+    return jsonify({"ok": True, "removed_from_rooms": len(rooms)})
+
+
+@app.patch("/api/tracks/<int:track_id>")
+@login_required
+def edit_track(track_id):
+    """Rename an uploaded song: {"title", "artist"}. Same permission as deleting."""
+    track = db.session.get(Track, track_id)
+    if track is None:
+        return jsonify({"error": "That song no longer exists."}), 404
+    if not track.uploaded:
+        return jsonify({"error": "Built-in songs can't be edited."}), 403
+    if track.uploaded_by and track.uploaded_by != g.user.id:
+        return jsonify({"error": "Only the person who uploaded this song can edit it."}), 403
+    data = request.get_json(silent=True) or {}
+    title = str(data.get("title", track.title)).strip()[:200]
+    artist = str(data.get("artist", track.artist)).strip()[:200] or "Unknown artist"
+    if not title:
+        return jsonify({"error": "Give the song a title."}), 400
+    track.title, track.artist = title, artist
+    db.session.commit()
+    announce_track_changed(track)
+    return jsonify(track.to_dict())
+
+
+def announce_track_changed(track):
+    """Song details changed: drop cached live state that embeds the old details, and
+    tell every device so titles update without touching playback."""
+    rooms = {qi.room_id for qi in QueueItem.query.filter_by(track_id=track.id).all()}
+    leaders = {leader_of(rid) for rid in rooms} - {None}
+    for leader_id in leaders:
+        r.delete(live_key(leader_id))
+    socketio.emit("track_updated", track.to_dict())
+    if rooms:
+        notify_members(rooms, "rooms_changed", {"by": SERVER_ID})
+
+
+def fix_raw_upload_names():
+    """Older uploads were named after their raw filename ("artist-song-title-123456");
+    give them a readable title and artist once."""
+    fixed = 0
+    for t in Track.query.filter_by(uploaded=True).all():
+        if t.artist in (None, "", "Unknown artist") and library.looks_like_raw_filename(t.title):
+            title, artist = library.guess_title_artist(t.title + ".mp3")
+            if (title, artist) != (t.title, t.artist):
+                t.title, t.artist = title, artist
+                fixed += 1
+    db.session.commit()
+    if fixed:
+        for key in r.scan_iter("live:*"):
+            r.delete(key)  # cached states may embed the old names
+    return fixed
+
+
+def prune_missing_uploads():
+    """Uploads whose audio file is gone (e.g. the project folder was replaced) can never
+    play, so drop them from the library and from every queue at startup."""
+    gone = [t for t in Track.query.filter_by(uploaded=True).all()
+            if not os.path.exists(os.path.join(MEDIA_DIR, t.filename))]
+    for t in gone:
+        remove_track_everywhere(t.id, "library cleanup")
+        db.session.delete(db.session.get(Track, t.id))
+    db.session.commit()
+    return len(gone)
 
 
 def room_summary(room, playing, alive, roles, member_counts):
@@ -637,15 +859,12 @@ def list_rooms():
     roles = {m.room_id: m.role for m in mine}
     rooms = Room.query.filter(Room.id.in_(list(roles))).order_by(Room.created_at).all() if roles else []
     leaders = {rm.group_leader or rm.id for rm in rooms}
-    states = {s.room_id: s for s in PlaybackState.query.filter(PlaybackState.room_id.in_(list(leaders))).all()} if leaders else {}
     playing = {}
-    for leader_id, s in states.items():
-        if s.queue_index is None:
-            continue
-        item = (QueueItem.query.filter_by(room_id=leader_id)
-                .order_by(QueueItem.position, QueueItem.id).offset(s.queue_index).first())
-        if item:
-            playing[leader_id] = (item.track.title, item.track.artist, item.track.to_dict()["cover"], bool(s.is_playing))
+    for leader_id in leaders:
+        s = live_state(leader_id)  # Redis first, PostgreSQL only on a cache miss
+        if s and s.get("track"):
+            t = s["track"]
+            playing[leader_id] = (t.get("title"), t.get("artist"), t.get("cover"), bool(s.get("is_playing")))
     counts = {}
     if roles:
         for m in RoomMember.query.filter(RoomMember.room_id.in_(list(roles))).all():
@@ -749,6 +968,7 @@ def delete_room(room_id):
     RoomMember.query.filter_by(room_id=room_id).delete()
     db.session.delete(room)
     db.session.commit()
+    r.delete(live_key(room_id))
     kick_sockets([room_id])
     if followers:
         announce_regroup({f.id for f in followers})
@@ -763,12 +983,44 @@ def get_room(room_id):
     if not membership(g.user.id, room_id):
         return not_found()
     leader_id = leader_of(room_id)
-    state = db.session.get(PlaybackState, leader_id) if leader_id else None
+    state = live_state(leader_id) if leader_id else None
     if state is None:
         return not_found()
-    items = queue_items(leader_id)
-    return jsonify({"zone_id": leader_id, "state": state_payload(state, items),
-                    "queue": queue_payload(leader_id, items)})
+    return jsonify({"zone_id": leader_id, "state": state, "queue": queue_payload(leader_id)})
+
+
+@app.post("/api/rooms/<room_id>/queue")
+@login_required
+def send_to_room(room_id):
+    """Assign music to any of your rooms from wherever you are, without switching to it.
+    {"track_id": 3, "play": false}: add to that room's queue; with "play": true it
+    starts playing there right away. Goes through the same locked state machine as
+    the in-room buttons, so it is safe against simultaneous commands."""
+    if not membership(g.user.id, room_id):
+        return not_found()
+    data = request.get_json(silent=True) or {}
+    leader_id = leader_of(room_id)
+    who = f"{g.user.display_name} (remote)"
+    try:
+        payload, queue = apply_command(leader_id, "queue_add", {"track_id": data.get("track_id")}, who)
+        if data.get("play"):
+            payload, _ = apply_command(leader_id, "jump", {"index": len(queue["items"]) - 1}, who)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    socketio.emit("state", payload, to=f"play:{leader_id}")
+    socketio.emit("queue", queue, to=f"play:{leader_id}")
+    notify_members(zone_room_ids(leader_id), "rooms_changed", {"by": SERVER_ID})
+    return jsonify({"ok": True, "zone_id": leader_id, "state": payload, "queue_length": len(queue["items"])})
+
+
+@app.get("/api/rooms/<room_id>/devices")
+@login_required
+def room_devices(room_id):
+    """The central controller's view of the room nodes: every device in the zone with
+    its latest status report (playing/paused/buffering, drift, health, last report)."""
+    if not membership(g.user.id, room_id):
+        return not_found()
+    return jsonify(presence_payload(leader_of(room_id)))
 
 
 def announce_regroup(room_ids):
@@ -873,6 +1125,8 @@ def on_connect(auth=None):
 @socketio.on("disconnect")
 def on_disconnect(*_):
     info = local_clients.pop(request.sid, None)
+    local_status.pop(request.sid, None)
+    r.delete(f"status:{request.sid}")
     drop_client(request.sid, info)
 
 
@@ -881,6 +1135,64 @@ def on_time_sync(_data=None):
     """Cristian's algorithm: the client measures round-trip time around this call."""
     metrics["events"] += 1
     return {"server_ms": time.time() * 1000, "server": SERVER_ID}
+
+
+STATUS_STATES = {"playing", "paused", "idle", "starting", "buffering", "blocked"}
+
+
+def device_health(state, drift_ms):
+    if state == "blocked":
+        return "blocked"  # browser autoplay policy: needs a tap before it can make sound
+    if state == "buffering":
+        return "buffering"
+    if state != "playing":
+        return "idle"
+    if drift_ms is None or abs(drift_ms) <= DRIFT_OK_MS:
+        return "in_sync"
+    return "correcting" if abs(drift_ms) <= DRIFT_BAD_MS else "out_of_sync"
+
+
+@socketio.on("status")
+def on_status(data):
+    """Room nodes report what they are actually doing every few seconds:
+    {state, position, drift_ms, version, track_id}. The controller derives a health
+    value, keeps the report in Redis (visible to every node) and re-broadcasts the
+    zone's speaker list when a device's health changes."""
+    info = local_clients.get(request.sid)
+    if not info or info.get("kind") == "virtual" or not info.get("room"):
+        return {"ok": False}
+    data = data if isinstance(data, dict) else {}
+    state = data.get("state") if data.get("state") in STATUS_STATES else "idle"
+
+    def num(v, lo, hi):
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return None
+        return round(min(hi, max(lo, v)), 1) if v == v else None
+
+    drift = num(data.get("drift_ms"), -60000, 60000)
+    report = {
+        "state": state,
+        "health": device_health(state, drift),
+        "position": num(data.get("position"), 0, 86400),
+        "drift_ms": drift if state == "playing" else None,
+        "version": data.get("version") if isinstance(data.get("version"), int) else None,
+        "track_id": data.get("track_id") if isinstance(data.get("track_id"), int) else None,
+        "reported_ms": now_ms(),
+        "server": SERVER_ID,
+    }
+    r.set(f"status:{request.sid}", json.dumps(report), ex=STATUS_TTL)
+    prev = local_status.get(request.sid)
+    local_status[request.sid] = {"ms": report["reported_ms"], "health": report["health"],
+                                 "drift_ms": report["drift_ms"] or 0}
+    # only re-broadcast when something visible changed, so steady devices cost nothing
+    if not prev or prev["health"] != report["health"] or \
+            abs((report["drift_ms"] or 0) - prev["drift_ms"]) >= 15:
+        dirty_rooms.add(info["room"])
+    else:
+        local_status[request.sid]["drift_ms"] = prev["drift_ms"]  # keep last broadcast value
+    return {"ok": True, "health": report["health"]}
 
 
 def socket_user_id():
@@ -898,7 +1210,7 @@ def on_join(data):
     if not membership(info["user_id"], room_id):
         return {"error": "Room not found."}
     leader_id = leader_of(room_id)
-    state = db.session.get(PlaybackState, leader_id) if leader_id else None
+    state = live_state(leader_id) if leader_id else None
     if state is None:
         return {"error": "Room not found."}
     prev, prev_play = info.get("room"), info.get("play")
@@ -919,7 +1231,7 @@ def on_join(data):
         "room_id": room_id,
         "zone_id": leader_id,
         "zone_rooms": zone_room_ids(leader_id),
-        "state": state_payload(state, items),
+        "state": state,
         "queue": queue_payload(leader_id, items),
         "presence": presence_payload(leader_id),
     }
@@ -1047,7 +1359,16 @@ def init_node():
                     try:
                         db.create_all()
                         migrate()
+                        fixed = library.normalize_uploads(db, Track, MEDIA_DIR)
+                        if fixed:
+                            log(f"converted {fixed} older upload(s) to CBR 192 kbps / 44.1 kHz MP3")
                         added = library.sync_library(db, Track, MEDIA_DIR)
+                        pruned = prune_missing_uploads()
+                        renamed = fix_raw_upload_names()
+                        if renamed:
+                            log(f"gave {renamed} upload(s) a readable title and artist")
+                        if pruned:
+                            log(f"removed {pruned} upload(s) whose file is missing")
                         seed_rooms()
                         log(f"database ready ({added} new tracks found)")
                     finally:

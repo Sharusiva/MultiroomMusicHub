@@ -17,6 +17,7 @@ class Track(db.Model):
     color = db.Column(db.String(16), default="#8b5cf6")
     duration = db.Column(db.Float, default=0.0)
     uploaded = db.Column(db.Boolean, default=False)
+    uploaded_by = db.Column(db.String(36), nullable=True)  # user id; null for built-ins and older uploads
     # signal-path details shown in the app's "signal path" view
     codec = db.Column(db.String(16), nullable=True)
     bitrate = db.Column(db.Integer, nullable=True)  # bits per second
@@ -41,6 +42,7 @@ class Track(db.Model):
             "sample_rate": self.sample_rate,
             "channels": self.channels,
             "uploaded": self.uploaded,
+            "uploaded_by": self.uploaded_by,
         }
 
 

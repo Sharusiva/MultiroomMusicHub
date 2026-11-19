@@ -10,7 +10,7 @@ const ms = (v, signed) => {
 
 export function syncHealth({ playing, waiting, blocked, driftMs }) {
   if (!playing) return { led: "", text: "paused" };
-  if (blocked) return { led: "warn", text: "tap play for sound" };
+  if (blocked) return { led: "warn", text: "tap anywhere for sound" };
   if (waiting) return { led: "", text: "starting" };
   return { led: Math.abs(driftMs) <= 25 ? "ok" : "warn", text: `${ms(driftMs)} drift` };
 }

@@ -119,6 +119,27 @@ function Player() {
     return () => clearInterval(t);
   }, [roomId]);
 
+  // Room-node status: tell the controller what this device is really doing
+  // (playing / buffering / needs a tap, and its drift) every 2 s, and immediately
+  // when that changes, so every device in the zone sees each speaker's health.
+  useEffect(() => {
+    if (!roomId) return;
+    let lastState = null;
+    const report = (force) => {
+      const socket = core.socket;
+      if (!socket?.connected || !roomRef.current) return;
+      const st = core.player.status();
+      if (!force && st.state === lastState && report.n++ % 4) return; // every 2 s, or on change
+      lastState = st.state;
+      socket.emit("status", { room_id: roomRef.current, ...st });
+    };
+    report.n = 0;
+    const t = setInterval(() => report(false), 500);
+    core.player.onStatus = () => report(true);
+    report(true);
+    return () => { clearInterval(t); core.player.onStatus = null; };
+  }, [roomId, core]);
+
   const leaveToHome = useCallback((msg) => {
     core.socket?.emit("leave");
     roomRef.current = null;
@@ -187,6 +208,15 @@ function Player() {
       loadRooms();
     });
     socket.on("library_changed", loadLibrary);
+    // a song was renamed: update titles everywhere without touching playback
+    socket.on("track_updated", (t) => {
+      const patch = (tr) => (tr && tr.id === t.id ? { ...tr, title: t.title, artist: t.artist } : tr);
+      setRoomState((s) => (s && s.track?.id === t.id ? { ...s, track: patch(s.track) } : s));
+      setQueue((q) => q.map((i) => (i.track?.id === t.id ? { ...i, track: patch(i.track) } : i)));
+      if (core.player.state?.track?.id === t.id) core.player.state.track = patch(core.player.state.track);
+      loadLibrary();
+      loadRooms();
+    });
     socket.on("rooms_changed", loadRooms);
     socket.on("room_closed", ({ room_id, user_id }) => {
       if (room_id !== roomRef.current) return;
@@ -268,6 +298,31 @@ function Player() {
     onVolumeCommit: (map) => setVolumes(map, true),
   }), [joinRoom, loadRooms, flash, setVolumes]);
 
+  // Assign music to another room from here: the server applies it to that room's
+  // queue and every device in that room hears it, without anyone switching rooms.
+  const sendToRoom = useCallback(async (t, room, play) => {
+    try {
+      await api(`/rooms/${room.id}/queue`, { method: "POST", json: { track_id: t.id, play } });
+      flash(play ? `Now playing ${t.title} in ${room.name}` : `Added ${t.title} to ${room.name}`);
+      loadRooms();
+    } catch (e) { flash(e.message); }
+  }, [flash, loadRooms]);
+
+  const deleteTrack = useCallback(async (t) => {
+    try {
+      const r = await api(`/tracks/${t.id}`, { method: "DELETE" });
+      flash(r.removed_from_rooms ? `Deleted ${t.title} (removed from ${r.removed_from_rooms} room${r.removed_from_rooms === 1 ? "" : "s"})` : `Deleted ${t.title}`);
+      loadLibrary();
+    } catch (e) { flash(e.message); }
+  }, [flash, loadLibrary]);
+
+  const editTrack = useCallback(async (t, details) => {
+    try {
+      await api(`/tracks/${t.id}`, { method: "PATCH", json: details });
+      flash(`Saved ${details.title}`);
+    } catch (e) { flash(e.message); }
+  }, [flash]);
+
   const resetCode = useCallback(async () => {
     try {
       await api(`/rooms/${roomRef.current}/code`, { method: "POST" });
@@ -308,9 +363,31 @@ function Player() {
 
   const playing = !!roomState?.is_playing;
   const togglePlay = useCallback(() => {
-    if (core.player.blocked) { core.player.blocked = false; core.player.apply(); }
+    if (core.player.blocked) {
+      // Browser blocked autoplay. This tap only turns sound on for THIS device;
+      // it must not pause the room for everyone else.
+      core.player.blocked = false;
+      core.player.apply();
+      if (playing) return;
+    }
     send(playing ? "pause" : "play");
   }, [core, playing, send]);
+
+  // Safari/iOS block audio a page starts on its own (e.g. a song sent from another
+  // room). Any tap or key press anywhere on the page counts, so turn sound on then.
+  useEffect(() => {
+    const wake = () => {
+      if (!core.player.blocked) return;
+      core.player.blocked = false;
+      core.player.apply();
+    };
+    window.addEventListener("pointerdown", wake, true);
+    window.addEventListener("keydown", wake, true);
+    return () => {
+      window.removeEventListener("pointerdown", wake, true);
+      window.removeEventListener("keydown", wake, true);
+    };
+  }, [core]);
 
   useEffect(() => {
     if (!roomId) return;
@@ -344,6 +421,7 @@ function Player() {
   const myGroup = groups.find((g) => g.leader === zoneId);
   const zoneLabel = zoneName(myGroup) || myRoom?.name || "";
   const linked = (myGroup?.rooms.length || 0) > 1;
+  const otherRooms = rooms.filter((r) => r.id !== zoneId && r.group_leader !== zoneId);
   const position = core.player.target() ?? 0;
   const waiting = playing && roomState && roomState.anchor_ms > core.clock.now();
   const health = syncHealth({ playing, waiting, blocked: core.player.blocked, driftMs: core.player.drift * 1000 });
@@ -402,7 +480,8 @@ function Player() {
             <Queue queue={queue} library={library} current={roomState?.queue_index} playing={playing}
               onJump={(i) => send("jump", { index: i })} onRemove={(id) => send("queue_remove", { item_id: id })}
               onClear={() => send("queue_clear")} uploading={uploading} onUpload={upload}
-              onAdd={(t) => { send("queue_add", { track_id: t.id }); flash(`Added ${t.title} to Up next`); }} />
+              onAdd={(t) => { send("queue_add", { track_id: t.id }); flash(`Added ${t.title} to Up next`); }}
+              otherRooms={otherRooms} onSend={sendToRoom} userId={user.id} onDeleteTrack={deleteTrack} onEditTrack={editTrack} />
           </div>
         </main>
 

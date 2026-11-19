@@ -41,6 +41,99 @@ def read_tags(path):
     return out
 
 
+import re as _re
+
+_PIXABAY_ID = _re.compile(r"[-_ ](\d{4,})$")
+
+
+def guess_title_artist(filename, tags=None):
+    """Best guess at (title, artist) for an upload whose file has no tags.
+    Handles "Artist - Title.mp3", and Pixabay-style "artist-song-title-123456.mp3"
+    (uploader name, then the title, then a numeric id)."""
+    tags = tags or {}
+    stem = os.path.splitext(os.path.basename(filename))[0].strip()
+    t, a = (tags.get("title") or "").strip(), (tags.get("artist") or "").strip()
+    raw_title = not t or t.lower().replace(" ", "") == stem.lower().replace(" ", "")
+    if t and a and a != "Unknown artist" and not raw_title:
+        return t, a
+    if " - " in stem:  # "Burna Boy - Last Last"
+        left, right = stem.split(" - ", 1)
+        return right.strip(), (a if a and a != "Unknown artist" else left.strip())
+    m = _PIXABAY_ID.search(stem)
+    if m:
+        words = [w for w in _re.split(r"[-_]+", stem[:m.start()]) if w]
+        if len(words) >= 2:
+            artist = a if a and a != "Unknown artist" else words[0]
+            return " ".join(words[1:]).title(), artist
+        stem = stem[:m.start()]
+    nice = " ".join(w for w in _re.split(r"[-_]+", stem) if w).title() or "Untitled"
+    return (t if t and not raw_title else nice), (a or "Unknown artist")
+
+
+def looks_like_raw_filename(title):
+    return bool(title) and " " not in title and bool(_PIXABAY_ID.search(title) or "-" in title or "_" in title)
+
+
+# Every upload is re-encoded to the same format as the built-in library: constant
+# bitrate MP3 at 44.1 kHz with an accurate seek table. Downloaded files are often
+# variable-bitrate or 48 kHz, which Safari seeks inaccurately; the sync engine then
+# keeps "correcting" and the song stutters or crackles.
+NORMAL_BITRATE = 192000
+NORMAL_RATE = 44100
+
+
+def ffmpeg_available():
+    from shutil import which
+    return which("ffmpeg") is not None
+
+
+def is_normalized(path, tags=None):
+    tags = tags or read_tags(path)
+    return (path.lower().endswith(".mp3") and tags.get("sample_rate") == NORMAL_RATE
+            and tags.get("bitrate") == NORMAL_BITRATE)
+
+
+def normalize_audio(src, dst):
+    """Re-encode src to a CBR 192 kbps / 44.1 kHz stereo MP3 at dst. Returns True on success."""
+    import subprocess
+    tmp = dst + ".part.mp3"
+    cmd = ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", src, "-map", "0:a:0", "-vn",
+           "-ar", str(NORMAL_RATE), "-ac", "2", "-codec:a", "libmp3lame", "-b:a", "192k",
+           "-write_xing", "1", "-map_metadata", "0", "-id3v2_version", "3", tmp]
+    try:
+        subprocess.run(cmd, check=True, timeout=300, capture_output=True)
+        os.replace(tmp, dst)
+        return True
+    except Exception:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        return False
+
+
+def normalize_uploads(db, Track, media_dir):
+    """Converts uploads saved by older versions (any format) to the normal format, once."""
+    if not ffmpeg_available():
+        return 0
+    fixed = 0
+    for track in Track.query.filter_by(uploaded=True).all():
+        src = os.path.join(media_dir, track.filename)
+        if not os.path.exists(src) or is_normalized(src):
+            continue
+        rel = os.path.splitext(track.filename)[0] + ".mp3"
+        dst = os.path.join(media_dir, rel)
+        if not normalize_audio(src, dst):
+            continue
+        if os.path.abspath(src) != os.path.abspath(dst):
+            os.remove(src)
+        tags = read_tags(dst)
+        track.filename, track.codec, track.bitrate = rel, tags["codec"], tags["bitrate"]
+        track.sample_rate, track.channels = tags["sample_rate"], tags["channels"]
+        track.duration = tags["duration"] or track.duration
+        fixed += 1
+    db.session.commit()
+    return fixed
+
+
 def extract_embedded_cover(path, media_dir, stem):
     """Saves artwork embedded in an uploaded file (ID3 APIC, MP4 covr, FLAC picture). Returns rel path or None."""
     try:
